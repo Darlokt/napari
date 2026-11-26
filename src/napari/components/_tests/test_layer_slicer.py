@@ -286,7 +286,11 @@ def test_submit_replaces_pending_request_after_worker_claims_previous(
     assert _wait_for_response(pending)[layer].id == 7
 
 
-def test_submit_replaces_each_pending_request_in_queue_order(layer_slicer):
+def test_submit_replaces_each_pending_request_in_queue_order(
+    layer_slicer, monkeypatch
+):
+    # Per layer: in frames, a waiting frame's requests are fixed.
+    monkeypatch.setattr(layer_slicer, '_frame_depth', 0)
     dims = Dims()
     blocker = FakeAsyncLayer()
     layer1 = FakeAsyncLayer()
@@ -454,6 +458,8 @@ def test_failed_replacement_allows_sibling_and_retry(
         error_received.set()
 
     monkeypatch.setattr(notification_manager, 'receive_error', _record_error)
+    # Per layer: in frames, a waiting frame's requests are fixed.
+    monkeypatch.setattr(layer_slicer, '_frame_depth', 0)
 
     @dataclass(frozen=True)
     class FakeSliceRequestError(FakeSliceRequest):
@@ -1140,3 +1146,102 @@ def test_read_limit_rises_when_layers_miss_steps():
     reads = SteppedReads(layers=8, duration=0.015)
     reads.run(30)
     assert reads.read_limit._settled >= 4
+
+
+def _two_readers(layer_slicer, monkeypatch, depth):
+    """A fast and a slow layer, two workers, frames of at most ``depth``."""
+    executor = ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(layer_slicer, '_executor', executor)
+    monkeypatch.setattr(layer_slicer, '_read_limit', FixedReadLimit(2))
+    monkeypatch.setattr(layer_slicer, '_frame_depth', depth)
+    return FakeAsyncLayer(), FakeAsyncLayer()
+
+
+def _record_ready(layer_slicer) -> list[dict]:
+    emitted = []
+    layer_slicer.events.ready.connect(
+        lambda event: emitted.append(
+            {weak(): response.id for weak, response in event.value.items()}
+        )
+    )
+    return emitted
+
+
+def test_frame_slices_are_emitted_together(layer_slicer, monkeypatch):
+    """A dims step's slices are emitted at once, after every layer read."""
+    fast, slow = _two_readers(layer_slicer, monkeypatch, 1)
+    emitted = _record_ready(layer_slicer)
+
+    with slow.lock:
+        first, _ = layer_slicer.submit(layers=[fast, slow], dims=Dims())
+        assert _wait_for_response(first)[fast].id == 1
+        assert emitted == []
+
+    layer_slicer.wait_until_idle(DEFAULT_TIMEOUT_SECS)
+    assert emitted == [{fast: 1, slow: 1}]
+
+
+def test_next_frame_waits_for_every_layer(layer_slicer, monkeypatch):
+    """A layer that has read a step reads no newer one until every layer
+    has read that step. Steps requested meanwhile become one frame."""
+    fast, slow = _two_readers(layer_slicer, monkeypatch, 1)
+    emitted = _record_ready(layer_slicer)
+
+    with slow.lock:
+        first, _ = layer_slicer.submit(layers=[fast, slow], dims=Dims())
+        assert _wait_for_response(first)[fast].id == 1
+        fast.started.clear()
+        second, _ = layer_slicer.submit(layers=[fast, slow], dims=Dims())
+        third, _ = layer_slicer.submit(layers=[fast, slow], dims=Dims())
+        assert third is second
+        assert not fast.started.wait(0.2)
+
+    layer_slicer.wait_until_idle(DEFAULT_TIMEOUT_SECS)
+    assert emitted == [{fast: 1, slow: 1}, {fast: 3, slow: 3}]
+
+
+def test_reload_is_not_held_by_a_frame(layer_slicer, monkeypatch):
+    """A single layer's reload is read and emitted while a frame waits for
+    a slower layer."""
+    fast, slow = _two_readers(layer_slicer, monkeypatch, 1)
+    emitted = _record_ready(layer_slicer)
+
+    with slow.lock:
+        first, _ = layer_slicer.submit(layers=[fast, slow], dims=Dims())
+        assert _wait_for_response(first)[fast].id == 1
+        [reload] = layer_slicer.submit(layers=[fast], dims=Dims())
+        assert _wait_for_response(reload)[fast].id == 2
+        assert emitted == [{fast: 2}]
+
+    layer_slicer.wait_until_idle(DEFAULT_TIMEOUT_SECS)
+    # The viewer shows only the newer of the fast layer's slices.
+    assert emitted == [{fast: 2}, {fast: 1, slow: 1}]
+
+
+def test_failed_read_does_not_hold_back_its_frame(layer_slicer, monkeypatch):
+    monkeypatch.setattr(
+        notification_manager, 'receive_error', lambda *args, **kwargs: None
+    )
+
+    @dataclass(frozen=True)
+    class FailingRequest(FakeSliceRequest):
+        def __call__(self) -> FakeSliceResponse:
+            raise RuntimeError('FailingRequest')
+
+    good, failing = _two_readers(layer_slicer, monkeypatch, 1)
+    monkeypatch.setattr(
+        failing,
+        '_make_slice_request',
+        lambda dims: FailingRequest(1, failing.lock, failing.started),
+    )
+    emitted = _record_ready(layer_slicer)
+    failures = []
+    layer_slicer.events.failed.connect(
+        lambda event: failures.append(event.layer())
+    )
+
+    layer_slicer.submit(layers=[good, failing], dims=Dims())
+    layer_slicer.wait_until_idle(DEFAULT_TIMEOUT_SECS)
+
+    assert emitted == [{good: 1}]
+    assert failures == [failing]

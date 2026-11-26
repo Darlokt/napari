@@ -88,6 +88,24 @@ class _SliceTask:
     layer: weakref.ReferenceType[Layer]
     request: _SliceRequest
     future: Future[dict] = field(default_factory=Future)
+    # A navigation request waits for the next frame. Others, such as reloads
+    # after an edit, are read as soon as their layer is free.
+    framed: bool = False
+
+
+@dataclass
+class _Frame:
+    """Navigation requests of all layers, read and shown together."""
+
+    todo: dict[weakref.ReferenceType[Layer], _SliceTask]
+    reading: set[weakref.ReferenceType[Layer]] = field(default_factory=set)
+    responses: dict[weakref.ReferenceType[Layer], Any] = field(
+        default_factory=dict
+    )
+
+    @property
+    def done(self) -> bool:
+        return not self.todo and not self.reading
 
 
 @dataclass
@@ -462,6 +480,13 @@ class _LayerSlicer:
         self._presented: weakref.WeakKeyDictionary[Layer, int] = (
             weakref.WeakKeyDictionary()
         )
+        # Navigation requests are read in frames: the waiting requests of
+        # all layers become a frame at once, each layer reads its frames in
+        # order, and a frame's slices are emitted together once every layer
+        # has read it. At most this many frames are open at once; 0 reads
+        # and shows each layer on its own.
+        self._frame_depth = settings.async_slicing_frames
+        self._frames: deque[_Frame] = deque()
 
     @contextmanager
     def force_sync(self) -> Generator[None, None, None]:
@@ -518,6 +543,10 @@ class _LayerSlicer:
         read finishes. A layer's responses therefore arrive in request order,
         but a response can be superseded by the time it arrives.
 
+        With frames on, the requests of a call with several layers wait as
+        one frame: every layer reads them before any layer reads a newer
+        frame, and their responses are emitted together.
+
         This should only be called from the main thread.
 
         Parameters
@@ -551,6 +580,10 @@ class _LayerSlicer:
         # when we want to perform sync slicing anyway.
         tasks: dict[weakref.ReferenceType[Layer], Future[dict]] = {}
         sync_layers = []
+        layers = list(layers)
+        # A step of the dims slices every layer and is read as one frame. A
+        # single layer's reload is read as soon as that layer is free.
+        framed = self._frame_depth > 0 and len(layers) > 1
         for layer in layers:
             # Slicing of non-visible layers is handled differently by sync
             # and async slicing. For async, we do not make request since a
@@ -581,7 +614,7 @@ class _LayerSlicer:
                     continue
                 try:
                     tasks[weak_layer] = self._queue_request(
-                        weak_layer, request
+                        weak_layer, request, framed=framed
                     )
                 except BaseException:
                     self._finish_without_response(weak_layer, request.id)
@@ -589,6 +622,10 @@ class _LayerSlicer:
             else:
                 logger.debug('Sync slicing for %s', layer)
                 sync_layers.append(layer)
+
+        if framed and tasks:
+            with self._tasks_changed:
+                self._open_frame()
 
         # Synchronous slicing can run concurrently with the async tasks.
         for layer in sync_layers:
@@ -603,20 +640,25 @@ class _LayerSlicer:
         self,
         weak_layer: weakref.ReferenceType[Layer],
         request: _SliceRequest,
+        *,
+        framed: bool = False,
     ) -> Future[dict]:
+        """Queue a request; the caller opens a frame for framed requests."""
         with self._tasks_changed:
             if self._shutdown:
                 raise RuntimeError('cannot schedule new slices after shutdown')
             task = self._pending.get(weak_layer)
             if task is not None:
                 task.request = request
+                # A reload joins a waiting navigation request in its frame.
+                task.framed = task.framed or framed
                 logger.debug('Replaced pending request with %s', request.id)
                 return task.future
 
-            task = _SliceTask(weak_layer, request)
+            task = _SliceTask(weak_layer, request, framed=framed)
             self._pending[weak_layer] = task
             self._tasks[task.future] = task
-            if weak_layer not in self._reading:
+            if not framed and weak_layer not in self._reading:
                 self._ready.append(weak_layer)
                 self._dispatch()
         task.future.add_done_callback(self._on_slice_done)
@@ -652,12 +694,64 @@ class _LayerSlicer:
                 return
             self._shutdown = True
             queued = list(self._pending.values())
+            for frame in self._frames:
+                queued.extend(frame.todo.values())
         for task in queued:
             task.future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
         self.events.disconnect()
         self.events.ready.disconnect()
         self.events.failed.disconnect()
+
+    def _open_frame(self) -> None:
+        """Make the waiting navigation requests a frame, if one may open.
+
+        The next frame opens once a layer is free to start it: with one
+        frame open at most, once every layer has read the current one.
+        """
+        if not self._frame_depth or len(self._frames) >= self._frame_depth:
+            return
+        todo = {w: t for w, t in self._pending.items() if t.framed}
+        if not todo:
+            return
+        if self._frames and all(
+            w in self._reading or self._frame_task(w) is not None for w in todo
+        ):
+            return
+        for weak_layer in todo:
+            del self._pending[weak_layer]
+        self._frames.append(_Frame(todo))
+        for weak_layer in todo:
+            if weak_layer not in self._ready:
+                self._ready.append(weak_layer)
+        self._dispatch()
+
+    def _frame_task(
+        self, weak_layer: weakref.ReferenceType[Layer]
+    ) -> _SliceTask | None:
+        """The layer's request in the oldest open frame it hasn't read."""
+        for frame in self._frames:
+            if (task := frame.todo.get(weak_layer)) is not None:
+                return task
+        return None
+
+    def _next_task(
+        self, weak_layer: weakref.ReferenceType[Layer]
+    ) -> _SliceTask | None:
+        """The request the layer reads next: its frame's, else a reload."""
+        task = self._frame_task(weak_layer)
+        if task is None:
+            task = self._pending.get(weak_layer)
+            if task is not None and task.framed:
+                return None
+        return task
+
+    def _present_frames(self) -> None:
+        """Emit the slices of every finished frame, oldest first."""
+        while self._frames and self._frames[0].done:
+            frame = self._frames.popleft()
+            if frame.responses:
+                self.events.ready(value=frame.responses)
 
     def _dispatch(self) -> None:
         """Hand ready layers to workers while the read limit allows."""
@@ -668,7 +762,7 @@ class _LayerSlicer:
             and not self._shutdown
         ):
             weak_layer = self._ready[index]
-            task = self._pending.get(weak_layer)
+            task = self._next_task(weak_layer)
             # A cancelled request can leave its layer queued twice.
             if weak_layer in self._reading or task is None:
                 del self._ready[index]
@@ -691,9 +785,16 @@ class _LayerSlicer:
     def _slice_layer(self, weak_layer: weakref.ReferenceType[Layer]) -> None:
         """Claim the layer's latest pending request and slice it."""
         with self._tasks_changed:
-            task = self._pending.pop(weak_layer, None)
+            frame = next(
+                (f for f in self._frames if weak_layer in f.todo), None
+            )
+            if frame is not None:
+                task = frame.todo.pop(weak_layer)
+                frame.reading.add(weak_layer)
+            elif (task := self._next_task(weak_layer)) is not None:
+                del self._pending[weak_layer]
             if task is None or not task.future.set_running_or_notify_cancel():
-                self._release(weak_layer, None)
+                self._release(weak_layer, None, frame)
                 return
             request = task.request
             # A copy from memory says nothing about the storage. Cheap reads
@@ -713,12 +814,13 @@ class _LayerSlicer:
             result = {}
             if weak_layer() is not None:
                 result = {weak_layer: request()}
-                self.events.ready(value=result)
+                if frame is None:
+                    self.events.ready(value=result)
         except BaseException as exc:  # noqa: BLE001 - delivered via the future
-            self._finish_reading(weak_layer, read)
+            self._finish_reading(weak_layer, read, frame)
             task.future.set_exception(exc)
         else:
-            self._finish_reading(weak_layer, read)
+            self._finish_reading(weak_layer, read, frame, result)
             task.future.set_result(result)
 
     def _storage_layers(self) -> int:
@@ -726,28 +828,43 @@ class _LayerSlicer:
         waiting = sum(
             1
             for weak_layer in self._ready
-            if (task := self._pending.get(weak_layer)) is not None
+            if (task := self._next_task(weak_layer)) is not None
             and _reads_storage(task.request)
         )
         return len(self._reading_storage) + waiting
 
     def _finish_reading(
-        self, weak_layer: weakref.ReferenceType[Layer], read: _Read | None
+        self,
+        weak_layer: weakref.ReferenceType[Layer],
+        read: _Read | None,
+        frame: _Frame | None,
+        result: dict | None = None,
     ) -> None:
         """Hand the layer's next request, if any, to a worker."""
         with self._tasks_changed:
-            self._release(weak_layer, read)
+            if frame is not None and result:
+                frame.responses.update(result)
+            self._release(weak_layer, read, frame)
 
     def _release(
-        self, weak_layer: weakref.ReferenceType[Layer], read: _Read | None
+        self,
+        weak_layer: weakref.ReferenceType[Layer],
+        read: _Read | None,
+        frame: _Frame | None = None,
     ) -> None:
         self._reading.discard(weak_layer)
         self._reading_chunks.pop(weak_layer, None)
         self._reading_storage.discard(weak_layer)
+        if frame is not None:
+            frame.reading.discard(weak_layer)
         if read is not None:
             self._read_limit.finish(read)
-        if weak_layer in self._pending:
+        if self._next_task(weak_layer) is not None:
             self._ready.append(weak_layer)
+        # Emitted with the lock held, so frames arrive in order. The Qt
+        # viewer only queues a signal; other listeners must not block.
+        self._present_frames()
+        self._open_frame()
         self._dispatch()
 
     def _on_slice_done(self, future: Future[dict]) -> None:
