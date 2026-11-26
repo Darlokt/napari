@@ -330,9 +330,10 @@ class ReadRecordingData(LockableData):
 
 
 @pytest.mark.usefixtures('_enable_async')
+@pytest.mark.parametrize('frames', [0, 1])
 @pytest.mark.parametrize('workers', [1, 2])
 def test_async_slice_superseded_requests_do_not_read_data(
-    make_napari_viewer, qtbot, rng, workers
+    make_napari_viewer, qtbot, rng, workers, frames
 ):
     """Superseded slice requests don't read data, and the newest slice of
     every layer is shown.
@@ -340,10 +341,12 @@ def test_async_slice_superseded_requests_do_not_read_data(
     Zooming a multiscale image refreshes each layer on its own, while a slice
     change slices all layers together. Interleaving them while the slicing
     thread is busy used to queue up requests that each read their plane.
+    In frames, every layer reads the step of a frame that has opened.
     """
     from napari.settings import get_settings
 
     get_settings().experimental.async_slicing_workers = workers
+    get_settings().experimental.async_slicing_frames = frames
     viewer = make_napari_viewer()
     datas = [ReadRecordingData(rng.random((8, 4, 5))) for _ in range(2)]
     layers = [Image(data, multiscale=False) for data in datas]
@@ -368,7 +371,7 @@ def test_async_slice_superseded_requests_do_not_read_data(
     qtbot.waitUntil(lambda: all(layer.loaded for layer in layers))
     # The read of plane 1 had already started, so only plane 7 is read again.
     assert datas[0].read_planes == [1, 7]
-    assert datas[1].read_planes == ([1, 7] if workers == 2 else [7])
+    assert datas[1].read_planes == ([1, 7] if workers == 2 or frames else [7])
     for data, vispy_layer in zip(datas, vispy_layers, strict=True):
         np.testing.assert_allclose(vispy_layer.node._data, data.data[7])
 
@@ -808,6 +811,9 @@ def test_viewer_respects_slice_worker_count(
 
 @pytest.mark.usefixtures('_enable_async')
 def test_layer_presented_while_sibling_is_reading(make_napari_viewer, qtbot):
+    from napari.settings import get_settings
+
+    get_settings().experimental.async_slicing_frames = 0
     viewer = make_napari_viewer()
     data = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
     fast = Image(data, contrast_limits=(0, 60))
@@ -823,6 +829,38 @@ def test_layer_presented_while_sibling_is_reading(make_napari_viewer, qtbot):
         assert fast.loaded
         assert not slow.loaded
     wait_until_vispy_image_data_equal(qtbot, slow_visual, data[2] + 100)
+    assert slow.loaded
+
+
+@pytest.mark.usefixtures('_enable_async')
+def test_frame_layers_presented_together(make_napari_viewer, qtbot):
+    """In frames, a layer of a dims step is shown with its siblings."""
+    from napari.settings import get_settings
+
+    get_settings().experimental.async_slicing_workers = 2
+    get_settings().experimental.async_slicing_frames = 1
+    viewer = make_napari_viewer()
+    data = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
+    fast = Image(data, contrast_limits=(0, 60))
+    slow_data = LockableData(data + 100)
+    slow = Image(slow_data, contrast_limits=(100, 160))
+    fast_visual = setup_viewer_for_async_slicing(viewer, fast)
+    slow_visual = setup_viewer_for_async_slicing(viewer, slow)
+    viewer._layer_slicer.wait_until_idle(timeout=5)
+    qtbot.waitUntil(lambda: fast.loaded and slow.loaded)
+    dims = viewer.dims.model_copy(update={'point': (2, 0, 0)})
+
+    with slow_data.lock:
+        fast_future, _ = viewer._layer_slicer.submit(
+            layers=[fast, slow], dims=dims
+        )
+        fast_future.result(timeout=5)
+        qtbot.wait(50)
+        assert not fast.loaded
+        assert not np.array_equal(fast_visual.node._data, data[2])
+    wait_until_vispy_image_data_equal(qtbot, fast_visual, data[2])
+    wait_until_vispy_image_data_equal(qtbot, slow_visual, data[2] + 100)
+    assert fast.loaded
     assert slow.loaded
 
 

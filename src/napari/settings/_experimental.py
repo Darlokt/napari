@@ -63,6 +63,21 @@ class ExperimentalSettings(EventedSettings):
         ),
     )
 
+    async_slicing_frames: int = Field(
+        2,
+        ge=0,
+        le=2,
+        title='Asynchronous slicing frames',
+        description=(
+            'How layers are shown while navigating with the dims sliders. '
+            '0: each layer shows its slice as soon as it is read. '
+            '1: all layers read the same step and are shown together, then '
+            'the newest step is read. 2: as 1, but a layer that has read a '
+            'step may start the next one while others still read. '
+            'Applies to newly opened viewers. Prototype.'
+        ),
+    )
+
     rdp_epsilon: float = Field(
         0.5,
         title='Shapes polygon lasso and path RDP epsilon',
